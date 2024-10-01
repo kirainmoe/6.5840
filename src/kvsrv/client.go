@@ -2,7 +2,12 @@ package kvsrv
 
 import (
 	"crypto/rand"
+	"fmt"
+	"log"
 	"math/big"
+	"runtime"
+	"strings"
+	"sync/atomic"
 
 	"6.5840/labrpc"
 )
@@ -10,6 +15,10 @@ import (
 type Clerk struct {
 	server *labrpc.ClientEnd
 	// You will have to modify this struct.
+
+	// client id to identify an unique service
+	id        int64
+	requestId int64
 }
 
 func nrand() int64 {
@@ -23,6 +32,11 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
 	// You'll have to add code here.
+
+	// use ck.id (clientId) and requestId to identify a unique request
+	ck.id = nrand() % 10000
+	ck.requestId = 0
+
 	return ck
 }
 
@@ -44,10 +58,15 @@ func (ck *Clerk) Get(key string) string {
 	reply := GetReply{}
 
 	for {
+		ck.log("get() start key=%v", key)
 		ok := ck.server.Call("KVServer.Get", &args, &reply)
 		if ok {
+			ck.log("get() success key=%v value=%v", key, reply.Value)
+
 			return reply.Value
 		}
+
+		ck.log("get() failure key=%v", key)
 	}
 }
 
@@ -62,16 +81,24 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
 	args := PutAppendArgs{
-		Key:   key,
-		Value: value,
+		Key:       key,
+		Value:     value,
+		ClientId:  ck.id,
+		RequestId: atomic.LoadInt64(&ck.requestId),
 	}
 	reply := PutAppendReply{}
 
 	for {
+		ck.log("putAppend() op=%s start key=%v value=%v", op, key, value)
+
 		ok := ck.server.Call("KVServer."+op, &args, &reply)
 		if ok {
+			ck.log("putAppend() op=%s success key=%v lastValue=%v", op, key, reply.Value)
+			atomic.AddInt64(&ck.requestId, 1)
 			return reply.Value
 		}
+
+		ck.log("putAppend() op=%s failure key=%v", op, key)
 	}
 }
 
@@ -82,4 +109,18 @@ func (ck *Clerk) Put(key string, value string) {
 // Append value to key's value and return that value
 func (ck *Clerk) Append(key string, value string) string {
 	return ck.PutAppend(key, value, "Append")
+}
+
+// Log utility function
+func (ck *Clerk) log(format string, v ...any) {
+	if !ENABLE_DEBUG_LOG {
+		return
+	}
+
+	pc, _, _, _ := runtime.Caller(1)
+	details := runtime.FuncForPC(pc)
+	items := strings.Split(details.Name(), ".")
+	methodName := items[len(items)-1]
+
+	log.Printf(fmt.Sprintf("[Client] id=%v method=%s message=%s", ck.id, methodName, format), v...)
 }
