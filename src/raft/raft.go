@@ -125,7 +125,8 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term = int(rf.currentTerm)
-	isleader = rf.role == ROLE_LEADER
+	role := atomic.LoadInt32(&rf.role)
+	isleader = role == ROLE_LEADER
 
 	return term, isleader
 }
@@ -199,10 +200,12 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.info("received RequestVote args=%+v", args)
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.info("received RequestVote args=%+v", args)
+	rf.info("process RequestVote")
 	rf.lastReceiveRpcTimestamp = time.Now().UnixMilli()
 
 	if args.Term < rf.currentTerm {
@@ -223,11 +226,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm && rf.role != ROLE_FOLLOWER {
 		rf.info("candidate term is ahead of current server, transform to follower incoming=%v current=%v",
 			args.Term, rf.currentTerm)
-		rf.role = ROLE_FOLLOWER
+		rf.convertToRole(ROLE_FOLLOWER)
 	}
 
 	// TODO: checks candidate's log is at least as up-to-date receiver's log
-	rf.currentTerm = args.Term // TODO: should update term here?
+	rf.updateTerm(args.Term) // TODO: should update term here?
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
 	rf.info("voted for the candidate in current term candidate=%v term=%v", args.CandidateId, args.Term)
@@ -312,13 +315,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// append new entries to log
-	for _, log := range args.Entries {
-		rf.log = append(rf.log, log)
-	}
+	rf.log = append(rf.log, args.Entries...)
 	rf.debug("append %d logs lastLogIndex=%v", len(args.Entries), len(rf.log))
 
 	// update follower's term
-	rf.currentTerm = max(rf.currentTerm, args.Term)
+	rf.updateTerm(max(rf.currentTerm, args.Term))
 
 	// update last receive time
 	rf.lastReceiveRpcTimestamp = time.Now().UnixMilli()
@@ -367,64 +368,46 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) requestVoteForAllServer() int32 {
 	rf.info("sending RequestVote() to all servers peersCount=%v", len(rf.peers))
 
-	var lock sync.Mutex
-	var wg sync.WaitGroup
-
-	votes := int64(1) // granted to self
-	updateTerm := int64(-1)
-
 	req := RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
 	}
 
 	// concurrently request vote from all peers (except self)
-	for index := range rf.peers {
-		if index == rf.me {
-			continue
+	result := SendRPCToAllPeersConcurrently(rf, "RequestVote", func(peerIndex int) *RequestVoteReply {
+		res := RequestVoteReply{}
+		rf.sendRequestVote(peerIndex, &req, &res)
+		return &res
+	})
+
+	rf.info("RequestVote returned")
+
+	votes := int64(1) // granted to self
+	updateTerm := int64(-1)
+
+	// summary votes and update known terms from peers
+	ForEachPeers(rf, func(index int) {
+		res := result[index]
+		rf.debug("result of peer=%v result=%+v", index, res)
+		if !res.Ok {
+			return
 		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			res := RequestVoteReply{}
-
-			rf.debug("send RequestVote to peer=%v", index)
-			ok := RunInTimeLimit(RPC_TIMEOUT_MS, func() {
-				rf.sendRequestVote(index, &req, &res)
-			})
-			if !ok {
-				rf.error("RequestVote call failed or timeout peerIndex=%d", index)
-				return
-			}
-
-			lock.Lock()
-			defer lock.Unlock()
-
-			// term in other follower is larger than current
-			if res.Term > rf.currentTerm {
-				rf.info("follower's term is larger than current candidate current=%v next=%v", rf.currentTerm, res.Term)
-
-				updateTerm = max(updateTerm, res.Term)
-				return
-			}
-
-			if res.VoteGranted {
-				votes++
-			}
-		}()
-	}
-
-	// wait for all goroutines done
-	wg.Wait()
+		reply := result[index].Result.(*RequestVoteReply)
+		rf.debug("reply=%v", reply)
+		updateTerm = max(updateTerm, reply.Term)
+		if reply.VoteGranted {
+			votes++
+		}
+	})
 
 	// follower's term > current term, update term and convert to follower
-	if updateTerm > -1 {
+	if updateTerm > rf.currentTerm {
+		rf.info("follower's term is larger than current candidate current=%v next=%v", rf.currentTerm, updateTerm)
 		rf.updateTerm(updateTerm)
 		return ROLE_FOLLOWER
 	}
 
+	// if gained majority of votes, current server is elected as leader
 	rf.info("get votes number votes=%v atLeast=%v", votes, int64(math.Ceil(float64(len(rf.peers))/2)))
 
 	if votes >= int64(math.Ceil(float64(len(rf.peers))/2)) {
@@ -439,9 +422,6 @@ func (rf *Raft) requestVoteForAllServer() int32 {
 func (rf *Raft) appendEntriesToAllServer(entries []LogEntry) {
 	rf.debug("leader: send AppendEntries to all servers")
 
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
 	prevLogIndex := len(rf.log)
 	prevLogTerm := int64(-1)
 
@@ -452,68 +432,48 @@ func (rf *Raft) appendEntriesToAllServer(entries []LogEntry) {
 		prevLogTerm = rf.log[prevLogIndex-1].Term
 	}
 
-	for index := range rf.peers {
-		if index == rf.me {
-			continue
+	result := SendRPCToAllPeersConcurrently(rf, "AppendEntries", func(peerIndex int) *AppendEntriesReply {
+		req := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      []LogEntry{}, // TODO: entries
+			// TODO: leaderCommit
+		}
+		res := AppendEntriesReply{}
+		rf.sendAppendEntries(peerIndex, &req, &res)
+		return &res
+	})
+
+	ForEachPeers(rf, func(index int) {
+		ok := result[index].Ok
+		payload := result[index].Result.(*AppendEntriesReply)
+
+		if !ok {
+			rf.error("AppendEntries call failed peerIndex=%v", index)
+			return
 		}
 
-		wg.Add(1)
+		if payload.Success {
+			rf.debug("AppendEntries success peerIndex=%v", index)
+			return
+		}
 
-		go func() {
-			defer wg.Done()
-			for {
-				req := AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  prevLogTerm,
-					Entries:      []LogEntry{}, // TODO: entries
-					// TODO: leaderCommit
-				}
-				res := AppendEntriesReply{}
+		// follower's term is ahead of leader
+		if payload.Term > nextTerm {
+			nextTerm = payload.Term
+			return
+		}
 
-				rf.debug("AppendEntries to peer=%v", index)
+		// follower's log is beheind leader, append [lastIndex, latest] to follower
+		// TODO
+		if payload.LastIndex >= 0 {
+			rf.debug("retry due to lastIndex > 0")
+			return
+		}
+	})
 
-				ok := RunInTimeLimit(RPC_TIMEOUT_MS, func() {
-					rf.sendAppendEntries(index, &req, &res)
-				})
-
-				if !ok {
-					rf.error("AppendEntries call failed peerIndex=%v", index)
-					return
-				}
-
-				if res.Success {
-					rf.debug("AppendEntries success peerIndex=%v", index)
-					return
-				}
-
-				mu.Lock()
-
-				// follower's term is ahead of leader
-				if res.Term > nextTerm {
-					nextTerm = res.Term
-					mu.Unlock()
-					return
-				}
-
-				// follower's log is beheind leader, append [lastIndex, latest] to follower
-				// TODO
-				if res.LastIndex >= 0 {
-					rf.debug("retry due to lastIndex > 0")
-					mu.Unlock()
-					continue
-				}
-
-				mu.Unlock()
-				break
-			}
-
-			rf.debug("AppendEntries successfully returns peer=%d", index)
-		}()
-	}
-
-	wg.Wait()
 	rf.debug("all followers have replied AppendEntries")
 
 	// convert to follower if term behind happened
@@ -569,11 +529,11 @@ func (rf *Raft) ticker() {
 	// first wait for a random timeout to prevent all servers go to candidate simultaneously
 	time.Sleep(time.Duration(rf.electionTimeoutMs) * time.Millisecond)
 
-	for rf.killed() == false {
+	for !rf.killed() {
 		// Your code here (3A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
-		role := rf.role
+		role := atomic.LoadInt32(&rf.role)
 		rf.mu.Unlock()
 
 		// Follower
@@ -597,9 +557,10 @@ func (rf *Raft) ticker() {
 			rf.updateTerm()
 			rf.convertToRole(ROLE_CANDIDATE)
 
-			ok := RunInTimeLimit(rf.electionTimeoutMs, func() {
+			ok, _ := RunInTimeLimit(rf.electionTimeoutMs, func() bool {
 				nextRole := rf.requestVoteForAllServer()
 				rf.convertToRole(nextRole)
+				return true
 			})
 
 			if !ok {
@@ -607,6 +568,7 @@ func (rf *Raft) ticker() {
 				rf.convertToRole(ROLE_FOLLOWER)
 			}
 
+			rf.debug("follower next role=%v", rf.getRole())
 			rf.mu.Unlock()
 		}
 
@@ -623,12 +585,14 @@ func (rf *Raft) ticker() {
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
+
+	rf.warn("serveer has been killed peer=%v", rf.me)
 }
 
 // #region internal methods
 func (rf *Raft) convertToRole(role int32) {
 	prevRole := rf.role
-	rf.role = role
+	atomic.StoreInt32(&rf.role, role)
 
 	if prevRole == role {
 		return
@@ -646,12 +610,12 @@ func (rf *Raft) convertToRole(role int32) {
 }
 
 func (rf *Raft) updateTerm(term ...int64) {
-	prevTerm := rf.currentTerm
+	prevTerm := atomic.LoadInt64(&rf.currentTerm)
 
 	if len(term) == 0 {
-		rf.currentTerm++
+		atomic.AddInt64(&rf.currentTerm, 1)
 	} else {
-		rf.currentTerm = term[0]
+		atomic.StoreInt64(&rf.currentTerm, term[0])
 	}
 
 	rf.info("server term updated prevTerm=%d nextTerm=%d", prevTerm, atomic.LoadInt64(&rf.currentTerm))
@@ -699,17 +663,22 @@ func (rf *Raft) getRole() string {
 	return rf.getRoleName(role)
 }
 
+func (rf *Raft) getTerm() int64 {
+	term := atomic.LoadInt64(&rf.currentTerm)
+	return term
+}
+
 func (rf *Raft) debug(format string, args ...any) {
-	Log(LEVEL_DEBUG, rf.getRole(), rf.me, rf.currentTerm, format, args...)
+	Log(LEVEL_DEBUG, rf.getRole(), rf.me, rf.getTerm(), format, args...)
 }
 func (rf *Raft) info(format string, args ...any) {
-	Log(LEVEL_INFO, rf.getRole(), rf.me, rf.currentTerm, format, args...)
+	Log(LEVEL_INFO, rf.getRole(), rf.me, rf.getTerm(), format, args...)
 }
 func (rf *Raft) warn(format string, args ...any) {
-	Log(LEVEL_WARN, rf.getRole(), rf.me, rf.currentTerm, format, args...)
+	Log(LEVEL_WARN, rf.getRole(), rf.me, rf.getTerm(), format, args...)
 }
 func (rf *Raft) error(format string, args ...any) {
-	Log(LEVEL_ERROR, rf.getRole(), rf.me, rf.currentTerm, format, args...)
+	Log(LEVEL_ERROR, rf.getRole(), rf.me, rf.getTerm(), format, args...)
 }
 
 // #endregion log utils

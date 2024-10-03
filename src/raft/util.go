@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -59,14 +60,16 @@ func randRange(min, max int64) int64 {
 	return rand.Int63n(max-min) + min
 }
 
-func RunInTimeLimit(timeMs int64, onRun func()) bool {
+func RunInTimeLimit[T any](timeMs int64, onRun func() T) (bool, T) {
 	flag := make(chan bool)
 	race := int32(0)
 
-	go func() {
-		onRun()
+	var payload T
 
+	go func() {
+		ret := onRun()
 		if atomic.LoadInt32(&race) == 0 {
+			payload = ret
 			flag <- true
 		}
 	}()
@@ -79,7 +82,64 @@ func RunInTimeLimit(timeMs int64, onRun func()) bool {
 	}()
 
 	res := <-flag
-	atomic.StoreInt32(&race, 0)
+	atomic.StoreInt32(&race, 1)
 
-	return res
+	return res, payload
+}
+
+type GenericRPCResponse struct {
+	Ok     bool
+	Result interface{}
+}
+
+func SendRPCToAllPeersConcurrently[T any](
+	rf *Raft,
+	rpcName string,
+	onRequest func(peerIndex int) *T,
+) []GenericRPCResponse {
+	rf.info("sending %v to all servers rpc=%v peersCount=%v", rpcName, len(rf.peers))
+
+	response := make([]GenericRPCResponse, len(rf.peers))
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for index := range rf.peers {
+		if index == rf.me {
+			continue
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			rf.debug("sending request rpc=%v peer=%v", rpcName, index)
+
+			ok, payload := RunInTimeLimit(RPC_TIMEOUT_MS, func() *T {
+				return onRequest(index)
+			})
+
+			if !ok {
+				rf.error("%v call failed or timeout fromPeer=%v toPeer=%v", rpcName, rf.me, index)
+			}
+
+			mu.Lock()
+			response[index].Ok = ok
+			response[index].Result = payload
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+
+	return response
+}
+
+func ForEachPeers(rf *Raft, cb func(index int)) {
+	for index := range rf.peers {
+		if index == rf.me {
+			continue
+		}
+		cb(index)
+	}
 }
