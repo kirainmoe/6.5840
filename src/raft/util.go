@@ -3,6 +3,7 @@ package raft
 import (
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"runtime"
 	"strings"
@@ -16,14 +17,16 @@ const Debug = true
 
 const (
 	LEVEL_DEBUG   = 0
-	LEVEL_INFO    = 1
-	LEVEL_WARN    = 2
-	LEVEL_ERROR   = 3
-	LEVEL_FATAL   = 4
-	LEVEL_DISABLE = 5
+	LEVEL_SUCCESS = 1
+	LEVEL_INFO    = 2
+	LEVEL_WARN    = 3
+	LEVEL_ERROR   = 4
+	LEVEL_FATAL   = 5
+	LEVEL_DISABLE = 6
 )
 
 const LOG_LEVEL = LEVEL_DISABLE
+const DISABLE_COLORFUL_OUTPUT = false
 
 func GetCaller() string {
 	pc, _, _, _ := runtime.Caller(3)
@@ -40,20 +43,36 @@ func Log(level int, role string, id int, term int64, format string, a ...interfa
 	}
 
 	levelStr := ""
+	colorStr := ""
 	switch level {
 	case LEVEL_DEBUG:
 		levelStr = "DEBUG"
+		colorStr = "90"
+	case LEVEL_SUCCESS:
+		levelStr = "SUCC"
+		colorStr = "32"
 	case LEVEL_INFO:
 		levelStr = "INFO"
+		colorStr = "96"
 	case LEVEL_WARN:
 		levelStr = "WARN"
+		colorStr = "93"
 	case LEVEL_ERROR:
 		levelStr = "ERROR"
+		colorStr = "91"
 	case LEVEL_FATAL:
 		levelStr = "FATAL"
+		colorStr = "31"
 	}
 
-	log.Printf(fmt.Sprintf("[%s] [%s] id=%v term=%d method=%s message=%s", levelStr, role, id, term, GetCaller(), format), a...)
+	formatStr := fmt.Sprintf("[%s] [id=%v term=%d role=%s] method=%s message=%s",
+		levelStr, id, term, role, GetCaller(), format)
+
+	if !DISABLE_COLORFUL_OUTPUT {
+		formatStr = fmt.Sprintf("\033[%sm%v\033[0m", colorStr, formatStr)
+	}
+
+	log.Printf(formatStr, a...)
 }
 
 func randRange(min, max int64) int64 {
@@ -65,11 +84,14 @@ func RunInTimeLimit[T any](timeMs int64, onRun func() T) (bool, T) {
 	race := int32(0)
 
 	var payload T
+	var mu sync.Mutex
 
 	go func() {
 		ret := onRun()
 		if atomic.LoadInt32(&race) == 0 {
+			mu.Lock()
 			payload = ret
+			mu.Unlock()
 			flag <- true
 		}
 	}()
@@ -84,6 +106,8 @@ func RunInTimeLimit[T any](timeMs int64, onRun func() T) (bool, T) {
 	res := <-flag
 	atomic.StoreInt32(&race, 1)
 
+	mu.Lock()
+	defer mu.Unlock()
 	return res, payload
 }
 
@@ -97,7 +121,7 @@ func SendRPCToAllPeersConcurrently[T any](
 	rpcName string,
 	onRequest func(peerIndex int) *T,
 ) []GenericRPCResponse {
-	rf.info("sending %v to all servers rpc=%v peersCount=%v", rpcName, len(rf.peers))
+	rf.info("sending %v to all servers rpc=%v peersCount=%v", rpcName, rpcName, len(rf.peers))
 
 	response := make([]GenericRPCResponse, len(rf.peers))
 
@@ -142,4 +166,15 @@ func ForEachPeers(rf *Raft, cb func(index int)) {
 		}
 		cb(index)
 	}
+}
+
+func GetMajority(value int) int64 {
+	return int64(math.Ceil(float64(value) / 2))
+}
+
+func LockAndRun[T any](rf *Raft, cb func() T) T {
+	rf.mu.Lock()
+	result := cb()
+	rf.mu.Unlock()
+	return result
 }
