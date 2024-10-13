@@ -20,12 +20,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -63,7 +65,7 @@ const (
 const (
 	ELECTION_TIMEOUT_MIN_MS = 1000
 	ELECTION_TIMEOUT_MAX_MS = 2000
-	RPC_TIMEOUT_MS          = 10
+	RPC_TIMEOUT_MS          = 50
 )
 
 // A Go object implementing a single Raft peer.
@@ -97,11 +99,11 @@ type Raft struct {
 
 	// persistant state on all servers, should be update to stable storage before responding RPCs
 
-	// latest term this server has been seen, default is 0
+	// (persist) latest term this server has been seen, default is 0
 	currentTerm int64
-	// candidateId that this server has voted for in current term, -1 if not voted
+	// (persist) candidateId that this server has voted for in current term, -1 if not voted
 	votedFor int
-	// log entries
+	// (persist) log entries
 	log []LogEntry
 
 	// volatile state on all servers
@@ -151,6 +153,18 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+
+	// encode persist states
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(int64(rf.votedFor))
+	encoder.Encode(rf.log)
+
+	rf.persister.Save(buffer.Bytes(), nil)
+
+	rf.success("save persist state term=%v vote=%v logLen=%v", rf.currentTerm, rf.votedFor, len(rf.log))
 }
 
 // restore previously persisted state.
@@ -158,19 +172,27 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+
+	if err := decoder.Decode(&rf.currentTerm); err != nil {
+		rf.error("decode currentTerm error=%v", err)
+	}
+
+	// workaround for: labgob warning: Decoding into a non-default variable/field int may not work
+	var votedFor int64
+	if err := decoder.Decode(&votedFor); err != nil {
+		rf.error("decode votedFor error=%v", err)
+	}
+	rf.votedFor = int(votedFor)
+
+	if err := decoder.Decode(&rf.log); err != nil {
+		rf.error("decode log entries error=%v", err)
+	}
+
+	rf.success("read persist state successful term=%v voted=%v logLen=%v",
+		rf.currentTerm, rf.votedFor, len(rf.log))
 }
 
 // the service says it has created a snapshot that has
@@ -239,14 +261,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	curLogLen := len(rf.log)
 
-	// checks candidate's log is at least as up-to-date receiver's log
-	// if args.LastLogIndex < curLogLen {
-	// 	rf.info("candidate's log is behind current candidate=%v candidateLast=%v selfLast=%v",
-	// 		args.CandidateId, args.LastLogIndex, curLogLen)
-	// 	reply.VoteGranted = false
-	// 	return
-	// }
-
 	// candidate's log term is conflict with current log (5.4.1)
 	if args.LastLogIndex > 0 && curLogLen > 0 {
 		lastTerm := rf.log[curLogLen-1].Term
@@ -275,7 +289,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.updateLastGrantVoteTime()
 	rf.updateTerm(args.Term) // TODO: should update term here?
-	rf.votedFor = args.CandidateId
+	rf.updateVotedFor(args.CandidateId)
 	reply.VoteGranted = true
 	rf.info("voted for the candidate in current term candidate=%v term=%v", args.CandidateId, args.Term)
 }
@@ -347,7 +361,7 @@ func (rf *Raft) requestVoteForAllServer() int32 {
 	}
 
 	rf.warn("election failed due to not gained enough votes, return to follower")
-	rf.votedFor = NOT_VOTED
+	rf.updateVotedFor(NOT_VOTED)
 
 	return ROLE_FOLLOWER
 }
@@ -366,8 +380,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term      int64
-	Success   bool
+	Term    int64
+	Success bool
+
+	// index of first entry that has conflict term
 	LastIndex int
 }
 
@@ -456,6 +472,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+// called by leader to append commands to leader's log, then send AppendEntries to followers
 func (rf *Raft) appendEntriesToAllServer(entries *[]LogEntry) {
 	rf.debug("leader: send AppendEntries to all servers length=%v", len(*entries))
 
@@ -467,6 +484,8 @@ func (rf *Raft) appendEntriesToAllServer(entries *[]LogEntry) {
 
 		// append logs to leader
 		rf.appendLogEntries(entries)
+
+		// if AppendEntries is success, leader can only commit logs up to current length
 		maxCommitInThisRequest = len(rf.log)
 
 		return true
@@ -793,7 +812,7 @@ func (rf *Raft) convertToRole(role int32) {
 	}
 
 	if role == ROLE_CANDIDATE {
-		rf.votedFor = rf.me
+		rf.updateVotedFor(rf.me)
 	}
 
 	rf.info("role convertion happened prevRole=%v nextRole=%v", rf.getRoleName(prevRole), rf.getRoleName(role))
@@ -818,8 +837,15 @@ func (rf *Raft) updateTerm(term ...int64) {
 	}
 
 	if prevTerm < curTerm {
-		rf.votedFor = NOT_VOTED
+		rf.updateVotedFor(NOT_VOTED)
 	}
+
+	rf.persist()
+}
+
+func (rf *Raft) updateVotedFor(nextVoteFor int) {
+	rf.votedFor = nextVoteFor
+	rf.persist()
 }
 
 // Refresh timestamp of last receiving RPC. This method is lock-free.
@@ -877,7 +903,7 @@ func (rf *Raft) initializeLeaderState() {
 	}
 
 	rf.matchIndex = make([]int, len(rf.peers))
-	rf.votedFor = rf.me
+	rf.updateVotedFor(rf.me)
 }
 
 func (rf *Raft) appendLogEntries(entries *[]LogEntry) {
@@ -906,6 +932,8 @@ func (rf *Raft) appendLogEntries(entries *[]LogEntry) {
 	}
 
 	rf.debug("append %v log entries to self logs currentLogs=%v", len(*entries), len(rf.log))
+
+	rf.persist()
 }
 
 func (rf *Raft) updateNextIndex(peerIndex int, value int) {
