@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math"
@@ -8,14 +9,12 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"6.5840/labgob"
 )
 
-// Debugging
-const Debug = false
+// #region Log
 
 const (
 	LEVEL_DEBUG   = 0
@@ -90,7 +89,7 @@ func Log(level int, payload DevLog) {
 		return fmt.Sprintf("\033[%sm%s=%+v\033[0m ", colorStr, key, value)
 	}
 
-	orders := []string{"_id", "_role", "_term", "_method", "message", "incoming", "current"}
+	orders := []string{"_id", "_role", "_term", "_logID", "_method", "_cost", "message", "incoming", "current"}
 
 	for _, pKey := range orders {
 		if _, ok := payload[pKey]; ok {
@@ -106,36 +105,27 @@ func Log(level int, payload DevLog) {
 	log.Println(logStr)
 }
 
+// #endregion
+
+// #region Utils
 func RunInTimeLimit[T any](timeMs int64, onRun func() T) (bool, T) {
-	flag := make(chan bool)
-	race := int32(0)
+	payload := make(chan T)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeMs))
+	defer cancel()
 
-	var payload T
-	var mu sync.Mutex
-
-	go func() {
-		ret := onRun()
-		if atomic.LoadInt32(&race) == 0 {
-			mu.Lock()
-			payload = ret
-			mu.Unlock()
-			flag <- true
-		}
-	}()
+	var empty T
 
 	go func() {
-		time.Sleep(time.Duration(timeMs) * time.Millisecond)
-		if atomic.LoadInt32(&race) == 0 {
-			flag <- false
-		}
+		payload <- onRun()
 	}()
 
-	res := <-flag
-	atomic.StoreInt32(&race, 1)
+	select {
+	case v := <-payload:
+		return true, v
 
-	mu.Lock()
-	defer mu.Unlock()
-	return res, payload
+	case <-ctx.Done():
+		return false, empty
+	}
 }
 
 type GenericRPCResponse struct {
@@ -148,7 +138,7 @@ func SendRPCToAllPeersConcurrently[T any](
 	rpcName string,
 	onRequest func(peerIndex int) *T,
 ) []GenericRPCResponse {
-	rf.info(DevLog{
+	rf.info(context.Background(), DevLog{
 		"message": fmt.Sprintf("sending %v to all servers", rpcName),
 		"rpcName": rpcName,
 		"peers":   len(rf.peers),
@@ -168,25 +158,25 @@ func SendRPCToAllPeersConcurrently[T any](
 		go func() {
 			defer wg.Done()
 
-			rf.debug(DevLog{
+			rf.debug(context.Background(), DevLog{
 				"message": fmt.Sprintf("sending request rpc=%v", rpcName),
 				"peer":    index,
 			})
 
-			ok, payload := RunInTimeLimit(RPC_TIMEOUT_MS, func() *T {
+			done, payload := RunInTimeLimit(RPC_TIMEOUT_MS, func() *T {
 				return onRequest(index)
 			})
 
-			if !ok {
-				rf.error(DevLog{
-					"message":  fmt.Sprintf("%v call failed or timeout", rpcName),
+			if !done {
+				rf.error(context.Background(), DevLog{
+					"message":  fmt.Sprintf("%v RPC call timeout", rpcName),
 					"fromPeer": rf.me,
 					"toPeer":   index,
 				})
 			}
 
 			mu.Lock()
-			response[index].Ok = ok
+			response[index].Ok = done
 			response[index].Result = payload
 			mu.Unlock()
 		}()
@@ -217,12 +207,21 @@ func LockAndRun[T any](rf *Raft, cb func() T) T {
 	return result
 }
 
-func TryDecode[T any](rf *Raft, decoder *labgob.LabDecoder, name string, target *T) {
+func TryDecode[T any](ctx context.Context, rf *Raft, decoder *labgob.LabDecoder, name string, target *T) {
 	if err := decoder.Decode(target); err != nil {
-		rf.error(DevLog{
+		rf.error(ctx, DevLog{
 			"message": "decode field from persist error",
 			"field":   name,
 			"error":   err,
 		})
 	}
 }
+
+type ContextKey string
+
+var (
+	ContextKeyLogID  = ContextKey("LogID")
+	ContextKeySelfID = ContextKey("SelfID")
+)
+
+// #endregion
